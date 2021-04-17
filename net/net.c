@@ -28,6 +28,29 @@
 #include <linux/ctype.h>
 #include <linux/err.h>
 
+static void tcp_dump(unsigned char *pkt, int len)
+{
+	struct iphdr *ip = net_eth_to_iphdr(pkt);
+	struct tcphdr *tcp = net_eth_to_tcphdr(pkt);
+	uint16_t flag = ntohs(tcp->doff_flag) & TCP_FLAG_MASK;
+	int opt = net_tcp_data_offset(tcp) - sizeof(struct tcphdr);
+	char cksum[sizeof("0xffff")];
+
+	snprintf(cksum, sizeof(cksum), "%#.4x", tcp_checksum(ip, tcp, len));
+	pr_debug( "%pI4:%u > %pI4:%u [%s%s%s%s%s%s] cksum %#.4x (%s) seq %u ack %u win %u opt [%d] len %d\n",
+		&ip->saddr, ntohs(tcp->src), &ip->daddr, ntohs(tcp->dst),
+		flag & TCP_FLAG_FIN ? "F" : "",
+		flag & TCP_FLAG_SYN ? "S" : "",
+		flag & TCP_FLAG_RST ? "R" : "",
+		flag & TCP_FLAG_PSH ? "P" : "",
+		flag & TCP_FLAG_ACK ? "A" : "",
+		flag & TCP_FLAG_URG ? "U" : "",
+		ntohs(tcp->sum),
+		tcp_checksum_ok(ip, tcp, len) ? "correct" : cksum,
+		ntohl(tcp->seq), ntohl(tcp->ack), ntohs(tcp->wnd),
+		opt, len);
+}
+
 unsigned char *NetRxPackets[PKTBUFSRX]; /* Receive packets		*/
 static unsigned int net_ip_id;
 
@@ -81,6 +104,31 @@ uint16_t net_checksum(unsigned char *ptr, int len)
 	xsum = (xsum & 0xffff) + (xsum >> 16);
 	xsum = (xsum & 0xffff) + (xsum >> 16);
 	return xsum & 0xffff;
+}
+
+uint16_t tcp_checksum(struct iphdr *ip, struct tcphdr *tcp, int len)
+{
+	uint32_t xsum;
+	struct psdhdr pseudo;
+	size_t hdrsize = net_tcp_data_offset(tcp);
+
+	pseudo.saddr = ip->saddr;
+	pseudo.daddr = ip->daddr;
+	pseudo.proto = htons(ip->protocol);
+	pseudo.ttlen = htons(hdrsize + len);
+
+	xsum = net_checksum((void *)&pseudo, sizeof(struct psdhdr));
+	xsum += net_checksum((void *)tcp, hdrsize + len);
+
+	while (xsum > 0xffff)
+		xsum = (xsum & 0xffff) + (xsum >> 16);
+
+	return xsum;
+}
+
+int tcp_checksum_ok(struct iphdr *ip, struct tcphdr *tcp, int len)
+{
+	return tcp_checksum(ip, tcp, len) == 0xffff;
 }
 
 IPaddr_t getenv_ip(const char *name)
@@ -395,6 +443,7 @@ static struct net_connection *net_new(struct eth_device *edev, IPaddr_t dest,
 	con->et = (struct ethernet *)con->packet;
 	con->ip = (struct iphdr *)(con->packet + ETHER_HDR_SIZE);
 	con->udp = (struct udphdr *)(con->packet + ETHER_HDR_SIZE + sizeof(struct iphdr));
+	con->tcp = (struct tcphdr *)(con->packet + ETHER_HDR_SIZE + sizeof(struct iphdr));
 	con->icmp = (struct icmphdr *)(con->packet + ETHER_HDR_SIZE + sizeof(struct iphdr));
 	con->handler = handler;
 
@@ -425,6 +474,30 @@ out:
 	return ERR_PTR(ret);
 }
 
+struct net_connection *net_tcp_eth_new(struct eth_device *edev, IPaddr_t dest,
+				       uint16_t dport, rx_handler_f *handler,
+				       void *ctx)
+{
+	struct net_connection *con = net_new(edev, dest, handler, ctx);
+	uint16_t doff;
+
+	if (IS_ERR(con))
+		return con;
+
+	con->proto = IPPROTO_TCP;
+	con->state = TCP_CLOSED;
+	con->tcp->src = htons(net_udp_new_localport());
+	con->tcp->dst = htons(dport);
+	con->tcp->seq = 0;
+	con->tcp->ack = 0;
+	doff = sizeof(struct tcphdr) / sizeof(uint32_t);
+	con->tcp->doff_flag = htons(doff << TCP_DOFF_SHIFT);
+	con->tcp->urp = 0;
+	con->ip->protocol = IPPROTO_TCP;
+
+	return con;
+}
+
 struct net_connection *net_udp_eth_new(struct eth_device *edev, IPaddr_t dest,
 				       uint16_t dport, rx_handler_f *handler,
 				       void *ctx)
@@ -446,6 +519,12 @@ struct net_connection *net_udp_new(IPaddr_t dest, uint16_t dport,
 		rx_handler_f *handler, void *ctx)
 {
 	return net_udp_eth_new(NULL, dest, dport, handler, ctx);
+}
+
+struct net_connection *net_tcp_new(IPaddr_t dest, uint16_t dport,
+		rx_handler_f *handler, void *ctx)
+{
+	return net_tcp_eth_new(NULL, dest, dport, handler, ctx);
 }
 
 struct net_connection *net_icmp_new(IPaddr_t dest, rx_handler_f *handler,
@@ -485,6 +564,167 @@ int net_udp_send(struct net_connection *con, int len)
 	con->udp->uh_sum = 0;
 
 	return net_ip_send(con, sizeof(struct udphdr) + len);
+}
+
+static int tcp_send(struct net_connection *con, int len, uint16_t flags)
+{
+	size_t hdr_size = net_tcp_data_offset(con->tcp);
+
+	con->tcp->doff_flag &= ~htons(TCP_FLAG_MASK);
+	con->tcp->doff_flag |= htons(flags);
+	con->tcp->sum = 0;
+	con->tcp->sum = ~tcp_checksum(con->ip, con->tcp, len);
+
+	tcp_dump(con->packet, len);
+
+	return net_ip_send(con, hdr_size + len);
+}
+
+int net_tcp_send(struct net_connection *con, int len)
+{
+	struct tcb *tcb = &con->tcb;
+	uint16_t flag = 0;
+
+	if (con->proto != IPPROTO_TCP)
+		return -EPROTOTYPE;
+	switch (con->state) {
+	case TCP_CLOSED:
+		return -ENOTCONN;
+	case TCP_LISTEN:
+		/* TODO: proceed as open */
+		break;
+	case TCP_SYN_SENT:
+	case TCP_SYN_RECV:
+		/* queue request or "error:  insufficient resources". */
+		break;
+	case TCP_ESTABLISHED:
+	case TCP_CLOSE_WAIT:
+		/* proceed */
+		break;
+	case TCP_FIN_WAIT1:
+	case TCP_FIN_WAIT2:
+	case TCP_TIME_WAIT:
+	case TCP_LAST_ACK:
+	case TCP_CLOSING:
+		return -ESHUTDOWN;
+	}
+
+	con->tcp->seq = htonl(tcb->snd_nxt);
+	tcb->snd_nxt += len;
+	flag |= TCP_FLAG_PSH;
+	if (1 || ntohl(con->tcp->ack) < con->tcb.rcv_nxt) {
+		flag |= TCP_FLAG_ACK;
+		con->tcp->ack = htonl(con->tcb.rcv_nxt);
+	} else {
+		con->tcp->ack = 0;
+	}
+
+	return tcp_send(con, len, flag);
+}
+
+int net_tcp_listen(struct net_connection *con)
+{
+	if (con->proto != IPPROTO_TCP)
+		return -EPROTOTYPE;
+
+	con->state = TCP_LISTEN;
+	return -1;
+}
+
+int net_tcp_open(struct net_connection *con)
+{
+	struct tcphdr *tcp = net_eth_to_tcphdr(con->packet);
+	struct tcb *tcb = &con->tcb;
+	int ret;
+
+	if (con->proto != IPPROTO_TCP)
+		return -EPROTOTYPE;
+	switch (con->state) {
+	case TCP_CLOSED:
+	case TCP_LISTEN:
+		break;
+	case TCP_SYN_SENT:
+	case TCP_SYN_RECV:
+	case TCP_ESTABLISHED:
+	case TCP_FIN_WAIT1:
+	case TCP_FIN_WAIT2:
+	case TCP_TIME_WAIT:
+	case TCP_CLOSE_WAIT:
+	case TCP_LAST_ACK:
+	case TCP_CLOSING:
+		return -EISCONN;
+	}
+
+	tcb->rcv_wnd = 1024;
+	tcb->snd_wnd = 0;
+	tcb->iss = random32() + (get_time_ns() >> 10);
+	con->state = TCP_SYN_SENT;
+
+	tcp->wnd = htons(tcb->rcv_wnd);
+	tcp->seq = htonl(tcb->iss);
+	tcb->snd_una = tcb->iss;
+	tcb->snd_nxt = tcb->iss + 1;
+	ret = tcp_send(con, 0, TCP_FLAG_SYN);
+	if (ret)
+		return ret;
+
+	ret = wait_on_timeout(6000 * MSECOND, con->state == TCP_ESTABLISHED);
+	if (ret)
+		return -ETIMEDOUT;
+
+	return con->ret; // TODO: return 0 ?
+}
+
+int net_tcp_close(struct net_connection *con)
+{
+	struct tcphdr *tcp = net_eth_to_tcphdr(con->packet);
+	struct tcb *tcb = &con->tcb;
+	int ret;
+
+	if (con->proto != IPPROTO_TCP)
+		return -EPROTOTYPE;
+	switch (con->state) {
+	case TCP_CLOSED:
+		return -ENOTCONN;
+	case TCP_LISTEN:
+	case TCP_SYN_SENT:
+		con->state = TCP_CLOSED;
+		return 0;
+		break;
+	case TCP_SYN_RECV:
+	case TCP_ESTABLISHED:
+		/* wait for pending send */
+		con->state = TCP_FIN_WAIT1;
+		break;
+	case TCP_FIN_WAIT1:
+	case TCP_FIN_WAIT2:
+		/* error: connection closing */
+		return -1;
+	case TCP_TIME_WAIT:
+	case TCP_LAST_ACK:
+	case TCP_CLOSING:
+		/* error: connection closing */
+		return -1;
+	case TCP_CLOSE_WAIT:
+		/* queue close request after pending sends */
+		con->state = TCP_LAST_ACK;
+		break;
+	}
+
+	tcp->seq = htonl(tcb->snd_nxt);
+	tcp->ack = htonl(tcb->rcv_nxt);
+	tcb->snd_nxt += 1;
+	ret = tcp_send(con, 0, TCP_FLAG_FIN | TCP_FLAG_ACK);
+	if (ret)
+		return ret;
+
+	ret = wait_on_timeout(1000 * MSECOND, con->state == TCP_CLOSED);
+	if (ret)
+		return -ETIMEDOUT;
+
+	net_unregister(con);
+
+	return con->ret; // TODO: return 0 ?
 }
 
 int net_icmp_send(struct net_connection *con, int len)
@@ -600,6 +840,203 @@ static int net_handle_udp(unsigned char *pkt, int len)
 	return -EINVAL;
 }
 
+static int net_handle_tcp(unsigned char *pkt, int len)
+{
+	size_t min_size = ETHER_HDR_SIZE + sizeof(struct iphdr);
+	struct net_connection *con, *c;
+	struct iphdr *ip = net_eth_to_iphdr(pkt);
+	struct tcphdr *tcp = net_eth_to_tcphdr(pkt);
+	struct tcb *tcb;
+	uint16_t flag;
+	uint16_t doff;
+	uint32_t tcp_len;
+	uint32_t seg_len;
+	uint32_t seg_ack;
+	uint32_t seg_seq;
+	uint32_t seg_last;
+	uint32_t rcv_wnd;
+	uint32_t rcv_nxt;
+	int seg_accept = 0;
+
+	if (len < (min_size + sizeof(struct tcphdr)))
+		goto bad;
+	flag = ntohs(tcp->doff_flag) & TCP_FLAG_MASK;
+	doff = net_tcp_data_offset(tcp);
+	if (doff < sizeof(struct tcphdr))
+		goto bad;
+	if (len < (min_size + doff))
+		goto bad;
+
+	seg_ack = ntohl(tcp->ack);
+	seg_seq = ntohl(tcp->seq);
+	tcp_len = net_eth_to_tcplen(pkt);
+	seg_len = tcp_len;
+	seg_len += !!(flag & TCP_FLAG_FIN);
+	seg_len += !!(flag & TCP_FLAG_SYN);
+
+	if (!tcp_checksum_ok(ip, tcp, tcp_len))
+		goto bad;
+
+	con = NULL;
+	list_for_each_entry(c, &connection_list, list) {
+		if (c->proto == IPPROTO_TCP && tcp->dst == c->tcp->src) {
+			con = c;
+			break;
+		}
+	}
+	if (con == NULL)
+		goto bad;
+	tcb = &con->tcb;
+
+	tcp_dump(pkt, tcp_len);
+
+	seg_last = seg_seq + seg_len - 1;
+	rcv_wnd = tcb->rcv_wnd;
+	rcv_nxt = tcb->rcv_nxt;
+	if (seg_len == 0 && rcv_wnd == 0)
+		seg_accept = seg_seq == rcv_nxt;
+	if (seg_len == 0 && rcv_wnd > 0)
+		seg_accept = rcv_nxt <= seg_seq && seg_seq < (rcv_nxt + rcv_wnd);
+	if (seg_len > 0 && rcv_wnd == 0)
+		seg_accept = 0; /* not acceptable */
+	if (seg_len > 0 && rcv_wnd > 0)
+		seg_accept = (rcv_nxt <= seg_seq && seg_seq < (rcv_nxt + rcv_wnd))
+			|| (rcv_nxt <= seg_last && seg_last < (rcv_nxt + rcv_wnd));
+
+	/* If an incoming segment is not acceptable, an acknowledgment
+        should be sent in reply (unless the RST bit is set, if so drop the segment and return):*/
+		/*  <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK> */
+		/*After sending the acknowledgment, drop the unacceptable segment
+		  and return */
+
+	switch (con->state) {
+	case TCP_CLOSED:
+		if (flag & TCP_FLAG_RST) {
+			goto drop; // return 0; /* DROP */
+		}
+		if (flag & TCP_FLAG_ACK) {
+			con->tcp->seq = 0;
+			con->tcp->ack = htonl(seg_seq + seg_len);
+			con->ret = tcp_send(con, 0, TCP_FLAG_RST | TCP_FLAG_ACK);
+		} else  {
+			con->tcp->seq = htonl(seg_ack);
+			con->ret = tcp_send(con, 0, TCP_FLAG_RST);
+		}
+		break;
+	case TCP_LISTEN:
+		/* TODO */
+		break;
+	case TCP_SYN_SENT:
+		if (flag & TCP_FLAG_ACK) {
+			if (seg_ack <= tcb->iss || seg_ack > tcb->snd_nxt) {
+				if (flag & TCP_FLAG_RST) {
+					goto drop; // return 0; /* DROP */
+				}
+				con->tcp->seq = htonl(seg_ack);
+				return tcp_send(con, 0, TCP_FLAG_RST);
+			}
+			if (tcb->snd_una > seg_ack || seg_ack > tcb->snd_nxt) {
+				goto drop; /* unacceptable */
+			}
+		}
+		if (flag & TCP_FLAG_RST) {
+			con->state = TCP_CLOSED;
+			con->ret = -ENETRESET;
+			break;
+		}
+		if ((flag & TCP_FLAG_SYN) && !(flag & TCP_FLAG_RST)) {
+			tcb->irs = seg_seq;
+			tcb->rcv_nxt = seg_seq + 1;
+			if (flag & TCP_FLAG_ACK)
+				tcb->snd_una = seg_ack;
+			if (tcb->snd_una > tcb->iss) {
+				con->state = TCP_ESTABLISHED;
+				con->tcp->seq = htonl(tcb->snd_nxt);
+				con->tcp->ack = htonl(tcb->rcv_nxt);
+				con->ret = tcp_send(con, 0, TCP_FLAG_ACK);
+			} else {
+				con->state = TCP_SYN_RECV;
+				tcb->snd_nxt = tcb->iss + 1;
+				con->tcp->seq = htonl(tcb->iss);
+				con->tcp->ack = htonl(tcb->rcv_nxt);
+				con->ret = tcp_send(con, 0, TCP_FLAG_SYN | TCP_FLAG_ACK);
+			}
+		}
+		break;
+	case TCP_SYN_RECV:
+	case TCP_ESTABLISHED:
+		/* second check the RST bit, */
+		if (flag & TCP_FLAG_RST) {
+			/* TODO: if passive open then return to LISTEN */
+			con->state = TCP_CLOSED;
+			con->ret = -ECONNREFUSED;
+			break;
+		}
+		if (!seg_accept) {
+			/* segment not acceptable */
+			con->tcp->seq = htonl(tcb->snd_nxt);
+			con->tcp->ack = htonl(tcb->rcv_nxt);
+			con->ret = tcp_send(con, 0, TCP_FLAG_ACK);
+			break;
+		}
+		if (flag & TCP_FLAG_FIN && flag & TCP_FLAG_ACK)
+			con->state = TCP_CLOSE_WAIT;
+
+		if (flag & TCP_FLAG_ACK)
+			tcb->snd_una = seg_ack;
+
+		tcb->rcv_nxt += seg_len;
+		con->tcp->seq = htonl(tcb->snd_nxt);
+		if (seg_len) {
+			con->tcp->ack = htonl(tcb->rcv_nxt);
+			con->ret = tcp_send(con, 0, TCP_FLAG_ACK |
+					    /* send FIN+ACK if FIN is set */
+					    (flag & TCP_FLAG_FIN));
+		}
+		con->handler(con->priv, pkt, len);
+		break;
+	case TCP_FIN_WAIT1:
+		if (flag & TCP_FLAG_FIN)
+			con->state = TCP_CLOSING;
+		if (flag & TCP_FLAG_ACK)
+			tcb->snd_una = seg_ack;
+		/* fall-through */
+	case TCP_FIN_WAIT2:
+		tcb->rcv_nxt += seg_len;
+		con->tcp->seq = htonl(tcb->snd_nxt);
+		if (seg_len) {
+			con->tcp->ack = htonl(tcb->rcv_nxt);
+			con->ret = tcp_send(con, 0, TCP_FLAG_ACK);
+		}
+	case TCP_CLOSE_WAIT:
+		/* all segment queus should be flushed */
+		if (flag & TCP_FLAG_RST) {
+			con->state = TCP_CLOSED;
+			con->ret = -ENETRESET;
+			break;
+		}
+		break;
+	case TCP_CLOSING:
+		con->state = TCP_TIME_WAIT;
+	case TCP_LAST_ACK:
+	case TCP_TIME_WAIT:
+		if (flag & TCP_FLAG_RST) {
+			con->state = TCP_CLOSED;
+			con->ret = 0;
+		}
+		break;
+	}
+	return con->ret;
+drop:
+	printf("drop\n");
+	tcp_dump(pkt, tcp_len);
+	return -EINVAL;
+bad:
+	printf("bad\n");
+//	net_bad_packet(pkt, len);
+	return -EINVAL;
+}
+
 static int ping_reply(struct eth_device *edev, unsigned char *pkt, int len)
 {
 	struct ethernet *et = (struct ethernet *)pkt;
@@ -687,6 +1124,8 @@ static int net_handle_ip(struct eth_device *edev, unsigned char *pkt, int len)
 		return net_handle_icmp(edev, pkt, len);
 	case IPPROTO_UDP:
 		return net_handle_udp(pkt, len);
+	case IPPROTO_TCP:
+		return net_handle_tcp(pkt, len);
 	}
 
 	return 0;

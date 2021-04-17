@@ -57,6 +57,13 @@ const char *strerror(int errnum)
 	case	EPROBE_DEFER	: str = "Requested probe deferral"; break;
 	case	ELOOP		: str = "Too many symbolic links encountered"; break;
 	case	ENODATA		: str = "No data available"; break;
+#ifdef CONFIG_NET
+	case	ENETRESET	: str = "Network dropped connection because of reset"; break;
+	case	ECONNABORTED	: str = "Software caused connection abort"; break;
+	case	ECONNRESET	: str = "Connection reset by peer"; break;
+	case	ENOBUFS		: str = "No buffer space available"; break;
+	case	ECONNREFUSED	: str = "Connection refused"; break;
+#endif
 #if 0 /* These are probably not needed */
 	case	ENOTBLK		: str = "Block device required"; break;
 	case	EFBIG		: str = "File too large"; break;
@@ -79,11 +86,6 @@ const char *strerror(int errnum)
 	case	EAFNOSUPPORT	: str = "Address family not supported by protocol"; break;
 	case	EADDRINUSE	: str = "Address already in use"; break;
 	case	EADDRNOTAVAIL	: str = "Cannot assign requested address"; break;
-	case	ENETRESET	: str = "Network dropped connection because of reset"; break;
-	case	ECONNABORTED	: str = "Software caused connection abort"; break;
-	case	ECONNRESET	: str = "Connection reset by peer"; break;
-	case	ENOBUFS		: str = "No buffer space available"; break;
-	case	ECONNREFUSED	: str = "Connection refused"; break;
 	case	EHOSTDOWN	: str = "Host is down"; break;
 	case	EALREADY	: str = "Operation already in progress"; break;
 	case	EINPROGRESS	: str = "Operation now in progress"; break;

@@ -2,6 +2,7 @@
 
 obj-y			+= lib.o
 obj-$(CONFIG_NET)	+= eth.o
+obj-$(CONFIG_CMD_IRC)	+= irc.o
 obj-$(CONFIG_NET)	+= net.o
 obj-$(CONFIG_NET_NFS)	+= nfs.o
 obj-$(CONFIG_NET_DHCP)	+= dhcp.o

@@ -1244,6 +1244,16 @@ config CMD_PING
 
 	  Usage: ping DESTINATION
 
+config CMD_IRC
+	tristate
+	prompt "irc"
+	default n
+	help
+	  Simple IRC client
+
+	  Usage: irc [-n] DESTINATION [PORT]
+
+
 config CMD_TFTP
 	depends on FS_TFTP
 	tristate
