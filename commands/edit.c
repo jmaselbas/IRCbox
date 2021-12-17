@@ -117,10 +117,10 @@ static void refresh(int full)
 	if (!full) {
 		if (smartscroll) {
 			if (scrline->next == lastscrline) {
+				pos(0, screenheight - 1);
+				printf("\x1b[K");
 				printf("\x1b[1T");
 				refresh_line(scrline, 0);
-				pos(0, screenheight);
-				printf("%*s", screenwidth, "");
 				return;
 			}
 
@@ -150,7 +150,7 @@ static void refresh(int full)
 	i++;
 	while (i < screenheight) {
 		pos(0, i++);
-		printf("~");
+		printf("%s\x1b[K", "~");
 	}
 }
 
@@ -730,6 +730,9 @@ again:
 				textx = strlen(curline->data);
 				merge_line(curline);
 			}
+			break;
+		case CTL_CH('l'):
+			refresh(1);
 			break;
 		case CTL_CH('d'):
 			ret = save_file(argv[1]);
