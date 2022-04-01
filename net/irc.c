@@ -469,11 +469,15 @@ static int do_irc(int argc, char *argv[])
 {
 	int ret;
 	char *host, *p;
+	const char *command = NULL;
 	uint16_t port = 6667;
 	int opt;
 
-	while ((opt = getopt(argc, argv, "n:")) > 0) {
+	while ((opt = getopt(argc, argv, "c:n:")) > 0) {
 		switch (opt) {
+		case 'c':
+			command = optarg;
+			break;
 		case 'n':
 			strlcpy(nick, optarg, sizeof(nick));
 			break;
@@ -516,6 +520,10 @@ static int do_irc(int argc, char *argv[])
 	if (nick[0] == '\0')
 		strlcpy(nick, "barebox", sizeof(nick));
 	irc_login(host, "barebox");
+
+	if (command)
+		irc_input(command);
+
 	while (con->state == TCP_ESTABLISHED) {
 		int len;
 		len = irc_readline(input_line, sizeof(input_line) - 1);
@@ -541,11 +549,12 @@ out:
 BAREBOX_CMD_HELP_START(irc)
 BAREBOX_CMD_HELP_TEXT("Options:")
 BAREBOX_CMD_HELP_OPT ("-n NICK\t", "nick to use")
+BAREBOX_CMD_HELP_OPT ("-c COMMAND\t", "command to run after login")
 BAREBOX_CMD_HELP_END
 
 BAREBOX_CMD_START(irc)
 	.cmd		= do_irc,
 	BAREBOX_CMD_DESC("IRC client")
-	BAREBOX_CMD_OPTS("[-n] DESTINATION[[/]PORT]")
+	BAREBOX_CMD_OPTS("[-nc] DESTINATION[[/]PORT]")
 	BAREBOX_CMD_GROUP(CMD_GRP_NET)
 BAREBOX_CMD_END

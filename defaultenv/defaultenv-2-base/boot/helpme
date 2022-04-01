@@ -1,0 +1,21 @@
+#!/bin/sh
+
+. /env/data/config
+
+if [ -n "$CONFIG_ARM" ]; then
+  supportgroup="#armlinux"
+elif [ -n "$CONFIG_RISCV" ]; then
+  supportgroup="#riscv"
+elif [ -n "$CONFIG_OPENRISC" ]; then
+  supportgroup="#openrisc"
+fi
+
+if [ -n "$supportgroup" ]; then
+  readline "Want to ask for support on $supportgroup? [Y/n]  " linuxsupport
+fi
+
+if [ "$linuxsupport" != "Y" ]; then
+  supportgroup="#barebox"
+fi
+
+irc -n $global.user -c "/j $supportgroup" irc.libera.chat
