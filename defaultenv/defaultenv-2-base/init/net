@@ -1,0 +1,10 @@
+eth0.mode=static
+eth0.ipaddr=172.0.0.2
+eth0.netmask=255.255.255.0
+eth0.gateway=172.0.0.1
+eth0.serverip=172.0.0.1
+global.net.gateway=172.0.0.1
+global.net.server=172.0.0.1
+global.net.nameserver=1.1.1.1
+ifup eth0
+
