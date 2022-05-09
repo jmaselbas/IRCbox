@@ -36,6 +36,22 @@ IPaddr_t net_gateway;
 static IPaddr_t net_nameserver;
 static char *net_domainname;
 
+static LIST_HEAD(connection_list);
+
+static struct net_connection *net_ip_get_con(int proto, uint16_t port)
+{
+	struct net_connection *con;
+
+	list_for_each_entry(con, &connection_list, list) {
+		if (con->proto != proto)
+			continue;
+		if (con->proto == IPPROTO_UDP && ntohs(con->udp->uh_sport) == port)
+			return con;
+	}
+
+	return NULL;
+}
+
 void net_set_nameserver(IPaddr_t nameserver)
 {
 	net_nameserver = nameserver;
@@ -358,8 +374,6 @@ IPaddr_t net_get_gateway(void)
 	return net_gateway;
 }
 
-static LIST_HEAD(connection_list);
-
 static struct net_connection *net_new(struct eth_device *edev, IPaddr_t dest,
 				      rx_handler_f *handler, void *ctx)
 {
@@ -587,15 +601,12 @@ static int net_handle_udp(unsigned char *pkt, int len)
 	struct iphdr *ip = (struct iphdr *)(pkt + ETHER_HDR_SIZE);
 	struct net_connection *con;
 	struct udphdr *udp;
-	int port;
 
 	udp = (struct udphdr *)(ip + 1);
-	port = ntohs(udp->uh_dport);
-	list_for_each_entry(con, &connection_list, list) {
-		if (con->proto == IPPROTO_UDP && port == ntohs(con->udp->uh_sport)) {
-			con->handler(con->priv, pkt, len);
-			return 0;
-		}
+	con = net_ip_get_con(IPPROTO_UDP, ntohs(udp->uh_dport));
+	if (con) {
+		con->handler(con->priv, pkt, len);
+		return 0;
 	}
 	return -EINVAL;
 }
