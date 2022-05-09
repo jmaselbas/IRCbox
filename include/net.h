@@ -143,6 +143,7 @@ struct ethernet {
 #define PROT_VLAN	0x8100		/* IEEE 802.1q protocol		*/
 
 #define IPPROTO_ICMP	 1	/* Internet Control Message Protocol	*/
+#define IPPROTO_TCP	 6	/* Transmission Control Protocol	*/
 #define IPPROTO_UDP	17	/* User Datagram Protocol		*/
 
 #define IP_BROADCAST    0xffffffff /* Broadcast IP aka 255.255.255.255 */
@@ -170,6 +171,67 @@ struct udphdr {
 	uint16_t	uh_ulen;	/* udp length */
 	uint16_t	uh_sum;		/* udp checksum */
 } __attribute__ ((packed));
+
+/* pseudo header for checksum */
+struct psdhdr {
+	uint32_t	saddr;
+	uint32_t	daddr;
+	uint16_t	proto;
+	uint16_t	ttlen;
+} __attribute__ ((packed));
+
+struct tcphdr {
+	uint16_t	src;	/* source port */
+	uint16_t	dst;	/* destination port */
+	uint32_t	seq;	/* sequence number */
+	uint32_t	ack;	/* acknowledge number */
+	uint16_t 	doff_flag;	/* data offset and flags */
+#define TCP_DOFF_MASK	0xf
+#define TCP_DOFF_SHIFT	12
+#define TCP_FLAG_FIN	BIT(0)
+#define TCP_FLAG_SYN	BIT(1)
+#define TCP_FLAG_RST	BIT(2)
+#define TCP_FLAG_PSH	BIT(3)
+#define TCP_FLAG_ACK	BIT(4)
+#define TCP_FLAG_URG	BIT(5)
+#define TCP_FLAG_ECE	BIT(6)
+#define TCP_FLAG_CWR	BIT(7)
+#define TCP_FLAG_NS	BIT(8)
+#define TCP_FLAG_MASK	0x1ff
+	uint16_t	wnd;	/* window size */
+	uint16_t	sum;	/* header and data checksum */
+	uint16_t	urp;	/* urgent pointer (if URG is set) */
+	/* The options start here. */
+} __attribute__ ((packed));
+
+enum tcp_state {
+	TCP_CLOSED = 0,
+	TCP_LISTEN,
+	TCP_SYN_SENT,
+	TCP_SYN_RECV,
+	TCP_ESTABLISHED,
+	TCP_FIN_WAIT1,
+	TCP_FIN_WAIT2,
+	TCP_TIME_WAIT,
+	TCP_CLOSE_WAIT,
+	TCP_LAST_ACK,
+	TCP_CLOSING,
+};
+
+/* Transmission Control Block */
+struct tcb {
+	uint32_t snd_una;
+	uint32_t snd_nxt;
+	uint32_t snd_wnd;
+	uint16_t snd_urp;
+	uint32_t snd_wl1;
+	uint32_t snd_wl2;
+	uint32_t rcv_nxt;
+	uint32_t rcv_wnd;
+	uint16_t rcv_urp;
+	uint32_t iss;
+	uint32_t irs;
+};
 
 /*
  *	Address Resolution Protocol (ARP) header.
@@ -264,6 +326,13 @@ struct eth_device *net_route(IPaddr_t ip);
 /* Do the work */
 void net_poll(void);
 
+static inline size_t net_tcp_data_offset(struct tcphdr *tcp)
+{
+	uint16_t doff;
+	doff = ntohs(tcp->doff_flag) >> TCP_DOFF_SHIFT;
+	return doff * sizeof(uint32_t);
+}
+
 static inline struct iphdr *net_eth_to_iphdr(char *pkt)
 {
 	return (struct iphdr *)(pkt + ETHER_HDR_SIZE);
@@ -272,6 +341,11 @@ static inline struct iphdr *net_eth_to_iphdr(char *pkt)
 static inline struct udphdr *net_eth_to_udphdr(char *pkt)
 {
 	return (struct udphdr *)(net_eth_to_iphdr(pkt) + 1);
+}
+
+static inline struct tcphdr *net_eth_to_tcphdr(char *pkt)
+{
+	return (struct tcphdr *)(net_eth_to_iphdr(pkt) + 1);
 }
 
 static inline struct icmphdr *net_eth_to_icmphdr(char *pkt)
@@ -295,8 +369,28 @@ static inline int net_eth_to_udplen(char *pkt)
 	return ntohs(udp->uh_ulen) - 8;
 }
 
+static inline char *net_eth_to_tcp_payload(char *pkt)
+{
+	struct tcphdr *tcp = net_eth_to_tcphdr(pkt);
+	return ((char *)tcp) + net_tcp_data_offset(tcp);
+}
+
+static inline int net_eth_to_iplen(char *pkt)
+{
+	struct iphdr *ip = net_eth_to_iphdr(pkt);
+	return ntohs(ip->tot_len) - sizeof(struct iphdr);
+}
+
+static inline int net_eth_to_tcplen(char *pkt)
+{
+	struct tcphdr *tcp = net_eth_to_tcphdr(pkt);
+	return net_eth_to_iplen(pkt) - net_tcp_data_offset(tcp);
+}
+
 int net_checksum_ok(unsigned char *, int);	/* Return true if cksum OK	*/
 uint16_t net_checksum(unsigned char *, int);	/* Calculate the checksum	*/
+int tcp_checksum_ok(struct iphdr *ip, struct tcphdr *tcp, int len);
+uint16_t tcp_checksum(struct iphdr *ip, struct tcphdr *tcp, int len);
 
 /*
  * The following functions are a bit ugly, but necessary to deal with
@@ -459,12 +553,18 @@ struct net_connection {
 	struct ethernet *et;
 	struct iphdr *ip;
 	struct udphdr *udp;
+	struct tcphdr *tcp;
 	struct eth_device *edev;
 	struct icmphdr *icmp;
 	unsigned char *packet;
 	struct list_head list;
 	rx_handler_f *handler;
 	int proto;
+	int state;
+	int ret;
+	union {
+		struct tcb tcb;
+	};
 	void *priv;
 };
 
@@ -477,6 +577,13 @@ struct net_connection *net_udp_new(IPaddr_t dest, uint16_t dport,
 		rx_handler_f *handler, void *ctx);
 
 struct net_connection *net_udp_eth_new(struct eth_device *edev, IPaddr_t dest,
+                                       uint16_t dport, rx_handler_f *handler,
+                                       void *ctx);
+
+struct net_connection *net_tcp_new(IPaddr_t dest, uint16_t dport,
+		rx_handler_f *handler, void *ctx);
+
+struct net_connection *net_tcp_eth_new(struct eth_device *edev, IPaddr_t dest,
                                        uint16_t dport, rx_handler_f *handler,
                                        void *ctx);
 
@@ -496,6 +603,17 @@ static inline void *net_udp_get_payload(struct net_connection *con)
 	return con->packet + sizeof(struct ethernet) + sizeof(struct iphdr) +
 		sizeof(struct udphdr);
 }
+
+static inline void *net_tcp_get_payload(struct net_connection *con)
+{
+	return con->packet + sizeof(struct ethernet) + sizeof(struct iphdr) +
+		net_tcp_data_offset(con->tcp);
+}
+
+int net_tcp_listen(struct net_connection *con);
+int net_tcp_open(struct net_connection *con);
+int net_tcp_send(struct net_connection *con, int len);
+int net_tcp_close(struct net_connection *con);
 
 int net_udp_send(struct net_connection *con, int len);
 int net_icmp_send(struct net_connection *con, int len);
