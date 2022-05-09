@@ -310,16 +310,29 @@ static int init_net_poll(void)
 }
 device_initcall(init_net_poll);
 
-static uint16_t net_udp_new_localport(void)
+static uint16_t net_new_localport(int proto)
 {
-	static uint16_t localport;
+	const uint16_t min_port = 32768;
+	const uint16_t max_port = 65535;
+	const uint16_t num_port = max_port - min_port + 1;
+	uint16_t localport;
 
-	localport++;
+	/* port randomization with the Algorithm 1 as defined in RFC6056 */
+	localport = min_port + random32() % num_port;
 
-	if (localport < 1024)
-		localport = 1024;
+	while (net_ip_get_con(proto, localport) != NULL) {
+		if (localport == max_port)
+			localport = min_port;
+		else
+			localport++;
+	}
 
 	return localport;
+}
+
+static uint16_t net_udp_new_localport(void)
+{
+	return net_new_localport(IPPROTO_UDP);
 }
 
 IPaddr_t net_get_serverip(void)
