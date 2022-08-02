@@ -586,6 +586,9 @@ static int tcp_send(struct net_connection *con, int len, uint16_t flags)
 	con->tcp->sum = 0;
 	con->tcp->sum = ~tcp_checksum(con->ip, con->tcp, len);
 
+	if (con->edev->tcp_dump)
+		con->edev->tcp_dump(con->edev, con->packet, len);
+
 	return net_ip_send(con, hdr_size + len);
 }
 
@@ -848,7 +851,7 @@ static int net_handle_udp(unsigned char *pkt, int len)
 	return -EINVAL;
 }
 
-static int net_handle_tcp(unsigned char *pkt, int len)
+static int net_handle_tcp(struct eth_device *edev, unsigned char *pkt, int len)
 {
 	size_t min_size = ETHER_HDR_SIZE + sizeof(struct iphdr);
 	struct net_connection *con;
@@ -889,6 +892,9 @@ static int net_handle_tcp(unsigned char *pkt, int len)
 	if (con == NULL)
 		goto bad;
 	tcb = &con->tcb;
+
+	if (edev->tcp_dump)
+		edev->tcp_dump(edev, pkt, len);
 
 	/* segment arrives */
 	seg_last = seg_seq + seg_len - 1;
@@ -1116,7 +1122,7 @@ static int net_handle_ip(struct eth_device *edev, unsigned char *pkt, int len)
 	case IPPROTO_UDP:
 		return net_handle_udp(pkt, len);
 	case IPPROTO_TCP:
-		return net_handle_tcp(pkt, len);
+		return net_handle_tcp(edev, pkt, len);
 	}
 
 	return 0;

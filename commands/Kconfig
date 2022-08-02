@@ -1289,6 +1289,14 @@ config CMD_ETHLOG
 
 	  Usage: ethlog [-r] [DEVICENAME]
 
+config CMD_TCPDUMP
+	tristate
+	prompt "tcpdump"
+	help
+	  dump tcp traffic.
+
+	  Usage: tcpdump [-r] [DEVICENAME]
+
 # end Network commands
 endmenu
 

@@ -48,6 +48,7 @@ struct eth_device {
 				 int *length);
 	void (*rx_monitor) (struct eth_device*, void *packet, int length);
 	void (*tx_monitor) (struct eth_device*, void *packet, int length);
+	void (*tcp_dump) (struct eth_device*, void *packet, int length);
 
 	struct eth_device *next;
 	void *priv;
